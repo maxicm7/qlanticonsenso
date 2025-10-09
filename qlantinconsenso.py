@@ -10,7 +10,6 @@ import time
 from deap import base, creator, tools, algorithms
 
 # --- Configuración Inicial DEAP ---
-# Se asegura de que los tipos no se creen múltiples veces en reruns de Streamlit
 if "FitnessMax" not in creator.__dict__:
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
 if "Individual" not in creator.__dict__:
@@ -31,7 +30,8 @@ def load_data_and_counts(uploaded_file):
         numero_a_atraso = dict(zip(df['Numero'], df['Atraso'])); numero_a_frecuencia = dict(zip(df['Numero'], df['Frecuencia']))
         atrasos_disponibles_int = sorted(df['Atraso'].unique()); numeros_validos = list(numero_a_atraso.keys())
         distribucion_probabilidad = {num: 1.0/len(numeros_validos) for num in numeros_validos} if numeros_validos else {}
-        atraso_counts = df['Atraso'].astype(str).value_counts().to_dict(); total_atraso_dataset = df['Atraso'].sum()
+        # --- MODIFICADO: atraso_counts ahora usa int como keys para facilitar búsquedas ---
+        atraso_counts = df['Atraso'].value_counts().to_dict(); total_atraso_dataset = df['Atraso'].sum()
         atraso_stats = {"min": df['Atraso'].min(), "max": df['Atraso'].max(), "p25": df['Atraso'].quantile(0.25), "p75": df['Atraso'].quantile(0.75)}
         return df, numero_a_atraso, numero_a_frecuencia, distribucion_probabilidad, atrasos_disponibles_int, atraso_counts, total_atraso_dataset, atraso_stats
     except Exception as e:
@@ -50,21 +50,19 @@ def load_historical_combinations(uploaded_file):
     except Exception as e:
         st.error(f"Error al procesar el archivo de historial: {e}"); return []
 
-# --- Funciones de Análisis Histórico ---
+# --- Funciones de Análisis Histórico (sin cambios) ---
 @st.cache_data
 def analyze_historical_special_calc(historical_sets, total_atraso_dataset, numero_a_atraso):
     if not historical_sets or total_atraso_dataset is None: return None
     values = [total_atraso_dataset + 40 - sum(numero_a_atraso.get(str(num), 0) for num in s) for s in historical_sets]
     if not values: return None
     return {"min": int(np.min(values)), "max": int(np.max(values)), "mean": int(np.mean(values)), "std": int(np.std(values))}
-
 @st.cache_data
 def analyze_historical_frequency_cv(historical_sets, numero_a_frecuencia):
     if not historical_sets or not numero_a_frecuencia: return None
     cv_values = [np.std(freqs) / np.mean(freqs) for s in historical_sets if (freqs := [numero_a_frecuencia.get(str(num), 0) for num in s]) and np.mean(freqs) > 0]
     if not cv_values: return None
     return {"min": np.min(cv_values), "max": np.max(cv_values), "mean": np.mean(cv_values), "std": np.std(cv_values)}
-
 @st.cache_data
 def analyze_historical_structure(historical_sets):
     if not historical_sets: return None, None, None
@@ -78,7 +76,6 @@ def analyze_historical_structure(historical_sets):
         consecutive_counts.append(max(max_consecutive, current_consecutive))
     sum_stats = {"min": int(np.min(sums)), "max": int(np.max(sums)), "mean": int(np.mean(sums)), "std": int(np.std(sums))}
     return sum_stats, parity_counts, Counter(consecutive_counts)
-
 @st.cache_data
 def analyze_historical_composition(historical_sets, numero_a_atraso, composicion_ranges):
     if not historical_sets: return None
@@ -93,7 +90,7 @@ def analyze_historical_composition(historical_sets, numero_a_atraso, composicion
 
 # --- Motores de Generación y Filtrado ---
 def generar_combinaciones_con_restricciones(params):
-    dist_prob, num_a_atraso, num_a_freq, restr_atraso, n_sel, n_comb, hist_combs, total_atraso, special_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold = params
+    dist_prob, num_a_atraso, num_a_freq, restr_atraso, n_sel, n_comb, hist_combs, total_atraso, special_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold, atraso_counts, scarcity_factor = params
     valores = list(dist_prob.keys()); combinaciones = []; intentos = 0; max_intentos = n_comb * 400
     while len(combinaciones) < n_comb and intentos < max_intentos:
         intentos += 1
@@ -119,18 +116,14 @@ def procesar_combinaciones(params_tuple, n_ejec):
     with ProcessPoolExecutor() as executor:
         return [future.result() for future in as_completed([executor.submit(generar_combinaciones_con_restricciones, params_tuple) for _ in range(n_ejec)])]
 
-def filtrar_por_composicion(combinaciones, numero_a_atraso, composicion_rules):
-    def get_category(atraso, ranges):
-        if ranges['caliente'][0] <= atraso <= ranges['caliente'][1]: return 'caliente'
-        elif ranges['tibio'][0] <= atraso <= ranges['tibio'][1]: return 'tibio'
-        elif ranges['frio'][0] <= atraso <= ranges['frio'][1]: return 'frio'
-        elif atraso >= ranges['congelado'][0]: return 'congelado'
-        return 'otro'
-    return [c for c in combinaciones if all(Counter(get_category(numero_a_atraso.get(str(n),-1), composicion_rules['ranges']) for n in c).get(cat,0)==cnt for cat,cnt in composicion_rules['counts'].items())]
-
+# --- MODIFICADO: La función de evaluación del AG ahora incluye la lógica de escasez ---
 def evaluar_individuo_deap(individuo_str, params):
-    dist_prob, num_a_atraso, num_a_freq, restr_atraso, n_sel, hist_combs, total_atraso, special_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold = params
+    # Desempaquetar todos los parámetros, incluyendo los nuevos
+    dist_prob, num_a_atraso, num_a_freq, restr_atraso, n_sel, hist_combs, total_atraso, special_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold, atraso_counts, scarcity_factor = params
+    
     individuo = [int(n) for n in individuo_str]
+    
+    # --- Verificaciones estándar ---
     if len(individuo) != n_sel or len(set(individuo)) != n_sel: return (0,)
     if not (sum_range[0] <= sum(individuo) <= sum_range[1]): return (0,)
     if sum(1 for n in individuo if n % 2 == 0) not in parity_counts_allowed: return (0,)
@@ -146,7 +139,29 @@ def evaluar_individuo_deap(individuo_str, params):
     suma_atrasos = sum(num_a_atraso.get(str(val), 0) for val in individuo)
     valor_especial = total_atraso + 40 - suma_atrasos
     if not (special_range[0] <= valor_especial <= special_range[1]): return (0,)
-    return (np.prod([dist_prob.get(str(val), 0) for val in individuo]),)
+
+    # --- Lógica de Fitness Base ---
+    fitness_base = np.prod([dist_prob.get(str(val), 0) for val in individuo])
+    
+    # --- NUEVO: Cálculo de Ponderación por Escasez de Atraso ---
+    if scarcity_factor > 0:
+        scarcity_score = 0
+        for num in individuo_str:
+            atraso = num_a_atraso.get(num)
+            if atraso is not None:
+                # El 'get' con default 1 evita errores si un atraso no está en la lista (improbable)
+                # y previene división por cero.
+                count = atraso_counts.get(atraso, 1)
+                # La ponderación es inversamente proporcional a la cantidad de números en ese grupo.
+                # A menos números (más exclusivo), mayor puntuación.
+                scarcity_score += 1.0 / count
+        
+        # Potenciamos el fitness base con el índice de escasez
+        # El '+1' asegura que el multiplicador siempre sea >= 1
+        fitness_final = fitness_base * (1 + scarcity_factor * scarcity_score)
+        return (fitness_final,)
+    
+    return (fitness_base,)
 
 def ejecutar_algoritmo_genetico_hibrido(initial_population, ga_params, backend_params):
     n_gen, n_pob, cxpb, mutpb, n_sel = ga_params; toolbox = base.Toolbox()
@@ -158,10 +173,10 @@ def ejecutar_algoritmo_genetico_hibrido(initial_population, ga_params, backend_p
     if not hall_of_fame: return [], "El AG no pudo encontrar ninguna solución válida."
     return hall_of_fame.items, None
 
-# --- MODIFICADO: La función ahora acepta el umbral de similitud como parámetro ---
 def seleccionar_salon_de_la_fama_diverso(hall_of_fame_items, num_a_seleccionar=5, umbral_similitud=3):
     if not hall_of_fame_items: return []
     portafolio_final = []; hall_of_fame_sets = [set(int(n) for n in ind) for ind in hall_of_fame_items]
+    if not hall_of_fame_sets: return []
     portafolio_final.append(hall_of_fame_sets[0])
     for candidato in hall_of_fame_sets[1:]:
         if len(portafolio_final) >= num_a_seleccionar: break
@@ -169,22 +184,11 @@ def seleccionar_salon_de_la_fama_diverso(hall_of_fame_items, num_a_seleccionar=5
             portafolio_final.append(candidato)
     return [sorted(list(comb)) for comb in portafolio_final]
 
-# --- NUEVO: Función para filtrar combinaciones basadas en patrones de apuestas comunes ---
 def es_anti_consenso(combinacion, n_max_bajos=3, umbral_suma_baja=85):
-    """
-    Evalúa si una combinación es 'anti-consenso' para evitar patrones de apuestas predecibles.
-    Devuelve True si es probable que sea poco apostada, False en caso contrario.
-    """
-    # 1. Penalizar exceso de números 'de cumpleaños' (1-31)
-    if sum(1 for n in combinacion if n <= 31) > n_max_bajos:
-        return False
-    # 2. Penalizar secuencias aritméticas perfectas (ej. 7, 14, 21...)
+    if sum(1 for n in combinacion if n <= 31) > n_max_bajos: return False
     diffs = np.diff(sorted(combinacion))
-    if len(set(diffs)) == 1:
-        return False
-    # 3. Penalizar combinaciones de suma total muy baja
-    if sum(combinacion) < umbral_suma_baja:
-        return False
+    if len(set(diffs)) == 1: return False
+    if sum(combinacion) < umbral_suma_baja: return False
     return True
 
 # ----------------------- ESTRUCTURA PRINCIPAL DE LA APLICACIÓN -----------------------
@@ -194,7 +198,7 @@ st.title("Modelo Híbrido Homeostático (Exploración + Optimización)")
 if 'suggested_composition' not in st.session_state: st.session_state.suggested_composition = None
 
 st.header("1. Cargar Archivos de Datos")
-col1, col2 = st.columns(2);
+col1, col2 = st.columns(2)
 with col1:
     uploaded_file = st.file_uploader("Sube CSV ('Numero', 'Atraso', 'Frecuencia')", type="csv", key="data_uploader")
     df, num_a_atraso, num_a_freq, dist_prob, atrasos_disp, atraso_counts, total_atraso, atraso_stats = load_data_and_counts(uploaded_file)
@@ -209,6 +213,7 @@ st.header("2. Configuración de Filtros de Precisión")
 restricciones_finales, composicion_rules, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold = {}, {}, (0, 999), [], 6, 6
 special_calc_range, freq_cv_range = (0, 99999), (0.0, 999.9)
 if df is not None:
+    # --- UI de Filtros (sin cambios) ---
     st.subheader("Filtros de Homeostasis (Etapa 1)")
     if historical_combinations_set:
         col_freq, col_spec = st.columns(2)
@@ -250,10 +255,11 @@ if df is not None:
     
     st.subheader("Filtros Estratégicos Adicionales")
     with st.expander("Atraso Individual, Similitud (Etapa 1) y Composición (Opcional)"):
-        st.write("**Filtro de Atrasos Individuales (Etapa 1)**"); selected_atrasos = st.multiselect("Selecciona 'Atraso' a restringir:", [str(a) for a in atrasos_disp], default=[str(a) for a in atrasos_disp]); cols_ui_atraso = st.columns(4)
-        for i, atraso_str in enumerate(selected_atrasos):
+        st.write("**Filtro de Atrasos Individuales (Etapa 1)**"); selected_atrasos_str = st.multiselect("Selecciona 'Atraso' a restringir:", [str(a) for a in atrasos_disp], default=[str(a) for a in atrasos_disp]); cols_ui_atraso = st.columns(4)
+        for i, atraso_str in enumerate(selected_atrasos_str):
             with cols_ui_atraso[i % 4]:
-                limit = st.number_input(f"Max Atraso '{atraso_str}':", 0, n_selecciones, atraso_counts.get(atraso_str, 0), key=f"res_{atraso_str}"); restricciones_finales[atraso_str] = limit
+                # Asegurarse que la key de atraso_counts es correcta (int o str)
+                limit = st.number_input(f"Max Atraso '{atraso_str}':", 0, n_selecciones, atraso_counts.get(int(atraso_str), 0), key=f"res_{atraso_str}"); restricciones_finales[atraso_str] = limit
         st.write("**Umbral de Similitud Histórica (Etapa 1)**"); hist_similarity_threshold = st.slider("Máx. repetidos de sorteos pasados:", 0, 5, 2)
         st.write("**Filtro Opcional de Composición (Post-AG)**"); max_atraso = atraso_stats.get("max", 100)
         c1, c2 = st.columns(2)
@@ -277,15 +283,32 @@ if df is not None:
 else:
     st.info("Carga los archivos para configurar los filtros.")
 
-# --- NUEVO: Sección para Estrategias Adversariales ---
-st.header("3. Estrategias Adversariales (Opcional)")
-use_anti_consenso = st.checkbox("Activar filtro 'Anti-Consenso' para evitar patrones de apuestas comunes", value=True)
-st.markdown("El filtro Anti-Consenso penaliza combinaciones con: muchos números de 'cumpleaños' (1-31), secuencias aritméticas perfectas, o sumas totales muy bajas.")
-umbral_diversidad = st.slider("Umbral de Similitud para Diversidad (más bajo = portafolio más diverso)", 1, 5, 2, key="umbral_div")
+st.header("3. Estrategias Adversariales")
+use_anti_consenso = st.checkbox("Activar filtro 'Anti-Consenso'", value=True, help="Penaliza patrones de apuestas comunes como cumpleaños, secuencias, etc.")
+umbral_diversidad = st.slider("Umbral de Similitud para Diversidad", 1, 5, 2, key="umbral_div", help="Más bajo = portafolio más diverso y con mayor cobertura.")
+
+# --- NUEVO: UI para la Ponderación por Escasez de Atraso ---
+with st.expander("🧠 ESTRATEGIA AVANZADA: Emular Comportamiento Adversarial"):
+    emulate_adversary = st.checkbox("Activar Ponderación por Escasez de Atraso", value=False)
+    scarcity_factor = st.slider(
+        "Factor de Escasez", 
+        min_value=0.0, 
+        max_value=5.0, 
+        value=1.0, 
+        step=0.1,
+        help="Aumenta la importancia de elegir números de grupos de atraso 'exclusivos' o poco numerosos. Un valor de 0 lo desactiva."
+    ) if emulate_adversary else 0.0
 
 st.header("4. Ejecutar Modelo Híbrido")
 if df is not None:
-    backend_params = (dist_prob, num_a_atraso, num_a_freq, restricciones_finales, n_selecciones, historical_combinations_set, total_atraso, special_calc_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold)
+    # --- MODIFICADO: Se añaden los nuevos parámetros al tuple que va al backend ---
+    backend_params = (
+        dist_prob, num_a_atraso, num_a_freq, restricciones_finales, n_selecciones, 
+        historical_combinations_set, total_atraso, special_calc_range, freq_cv_range, 
+        sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold,
+        atraso_counts, scarcity_factor
+    )
+    params_sim = backend_params # Simulación ahora usa los mismos params por simplicidad
     
     n_final_combinations = st.sidebar.number_input("Número de combinaciones del portafolio final:", min_value=1, max_value=20, value=5, key="n_final")
 
@@ -293,7 +316,6 @@ if df is not None:
         st.subheader("Resultados del Proceso Híbrido")
         with st.spinner("Etapa 1: Explorando masivamente el espacio de soluciones..."):
             start_time = time.time()
-            params_sim = (dist_prob, num_a_atraso, num_a_freq, restricciones_finales, n_selecciones, sim_n_comb, historical_combinations_set, total_atraso, special_calc_range, freq_cv_range, sum_range, parity_counts_allowed, max_consecutive_allowed, hist_similarity_threshold)
             resultados_mc = procesar_combinaciones(params_sim, sim_n_ejec)
             st.info(f"Etapa 1 completada en {time.time() - start_time:.2f} s.")
         
@@ -301,9 +323,9 @@ if df is not None:
         st.info(f"🧬 Caldo de Cultivo: **{len(plausible_combinations)}** combinaciones de élite únicas generadas.")
 
         if not plausible_combinations:
-            st.warning("La Etapa 1 no encontró combinaciones plausibles con los filtros actuales. El AG no puede ejecutarse. Intenta relajar los filtros.")
+            st.warning("La Etapa 1 no encontró combinaciones plausibles. Intenta relajar los filtros.")
         else:
-            with st.spinner("Etapa 2: Optimizando el caldo de cultivo con Algoritmo Genético..."):
+            with st.spinner("Etapa 2: Optimizando con AG (considerando escasez si está activado)..."):
                 ga_params_hibrido = (ga_ngen, ga_npob, ga_cxpb, ga_mutpb, n_selecciones)
                 salon_de_la_fama, err_msg = ejecutar_algoritmo_genetico_hibrido(plausible_combinations, ga_params_hibrido, backend_params)
             
@@ -312,16 +334,15 @@ if df is not None:
             elif salon_de_la_fama:
                 st.success("✨ ¡Optimización completada! Se ha generado un 'Salón de la Fama'.")
                 
-                # --- MODIFICADO: Aplicación de estrategias adversariales al portafolio ---
                 portafolio_diverso = seleccionar_salon_de_la_fama_diverso(salon_de_la_fama, num_a_seleccionar=n_final_combinations, umbral_similitud=umbral_diversidad)
                 portafolio_a_mostrar = portafolio_diverso
                 
                 if use_anti_consenso:
                     portafolio_filtrado = [c for c in portafolio_diverso if es_anti_consenso(c)]
                     if not portafolio_filtrado:
-                        st.warning("El filtro 'Anti-Consenso' eliminó todas las combinaciones del portafolio diverso. Mostrando el portafolio original.")
+                        st.warning("El filtro 'Anti-Consenso' eliminó todas las combinaciones.")
                     else:
-                        st.info(f"💡 Filtro 'Anti-Consenso' aplicado. Se muestran {len(portafolio_filtrado)} de las {len(portafolio_diverso)} combinaciones originales.")
+                        st.info(f"💡 Filtro 'Anti-Consenso' aplicado. Se muestran {len(portafolio_filtrado)} de {len(portafolio_diverso)}.")
                         portafolio_a_mostrar = portafolio_filtrado
                 
                 if not portafolio_a_mostrar:
@@ -331,20 +352,32 @@ if df is not None:
                     data = []
                     for i, comb in enumerate(portafolio_a_mostrar):
                         freqs = [num_a_freq.get(str(v),0) for v in comb]
-                        data.append({"Ranking": f"#{i+1}", "Combinación": " - ".join(map(str, comb)), "CV Frecuencia": np.std(freqs)/np.mean(freqs) if np.mean(freqs) > 0 else 0, "Cálculo Especial": total_atraso + 40 - sum(num_a_atraso.get(str(v),0) for v in comb), "Suma": sum(comb), "Pares": sum(1 for n in comb if n % 2 == 0)})
+                        # --- NUEVO: Cálculo del Índice de Escasez para mostrarlo en la tabla ---
+                        scarcity_score_display = sum(1.0 / atraso_counts.get(num_a_atraso.get(str(n)), 1) for n in comb)
+                        
+                        data.append({
+                            "Ranking": f"#{i+1}", 
+                            "Combinación": " - ".join(map(str, comb)), 
+                            "Índice Escasez": scarcity_score_display,
+                            "CV Frecuencia": np.std(freqs)/np.mean(freqs) if np.mean(freqs) > 0 else 0, 
+                            "Cálculo Especial": total_atraso + 40 - sum(num_a_atraso.get(str(v),0) for v in comb), 
+                            "Suma": sum(comb), 
+                            "Pares": sum(1 for n in comb if n % 2 == 0)
+                        })
                     df_results = pd.DataFrame(data)
                     df_results['CV Frecuencia'] = df_results['CV Frecuencia'].map('{:,.2f}'.format)
+                    df_results['Índice Escasez'] = df_results['Índice Escasez'].map('{:,.3f}'.format)
                     st.dataframe(df_results.set_index("Ranking"))
             else:
-                st.warning("La Etapa 2 (AG) no pudo encontrar soluciones válidas a partir de la población inicial.")
+                st.warning("La Etapa 2 (AG) no pudo encontrar soluciones válidas.")
 else:
     st.warning("Carga los archivos de datos para ejecutar los algoritmos.")
 
-# --- MODIFICADO: Guía del Sidebar actualizada con las nuevas estrategias ---
+# --- MODIFICADO: Guía del Sidebar actualizada ---
 st.sidebar.header("Guía Estratégica")
 st.sidebar.markdown("Este modelo te permite jugar un 'juego contra el juego', asumiendo que el sistema puede ser un adversario inteligente.")
 st.sidebar.subheader("Flujo de Trabajo Táctico")
-st.sidebar.markdown("**1. Exploración (Simulación):**\n- Genera millones de combinaciones y las filtra por **homeostasis y estructura** para crear un \"caldo de cultivo\" de candidatos de élite.")
-st.sidebar.markdown("**2. Optimización (AG):**\n- El Algoritmo Genético optimiza este caldo de cultivo para encontrar las combinaciones matemáticamente 'perfectas'.")
-st.sidebar.markdown("**3. Estrategia Adversarial (Anti-Consenso):**\n- Filtra las combinaciones 'perfectas' para **eliminar patrones obvios** (cumpleaños, secuencias) que otros jugadores (y un posible adversario) podrían anticipar.")
-st.sidebar.markdown("**4. Portafolio Diverso:**\n- Selecciona un conjunto final de combinaciones que son **muy diferentes entre sí** para maximizar la cobertura y no poner todos los 'huevos en la misma canasta'.")
+st.sidebar.markdown("**1. Exploración (Simulación):**\n- Genera un \"caldo de cultivo\" de candidatos de élite basados en filtros de homeostasis y estructura.")
+st.sidebar.markdown("**2. Optimización (AG):**\n- El AG optimiza este caldo para encontrar las combinaciones matemáticamente 'perfectas'.")
+st.sidebar.markdown("**3. Emulación Adversarial (Ponderación por Escasez):**\n- **(NUEVO)** Le enseña al AG a 'pensar como la máquina', **favoreciendo combinaciones formadas por números de grupos de atraso muy pequeños y exclusivos**.")
+st.sidebar.markdown("**4. Portafolio Final:**\n- Aplica filtros de **Anti-Consenso** y **Diversidad** para construir un portafolio final robusto, impredecible y con máxima cobertura.")
